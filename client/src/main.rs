@@ -500,6 +500,8 @@ fn main() -> Result<()> {
                 amm_config_state.trade_fee_rate,
                 amm_config_state.protocol_fee_rate,
                 amm_config_state.fund_fee_rate,
+                u128::from(token_0_vault_info.base.amount),
+                u128::from(token_1_vault_info.base.amount),
             )
             .ok_or(raydium_cp_swap::error::ErrorCode::ZeroTradingTokens)
             .unwrap();
@@ -654,6 +656,8 @@ fn main() -> Result<()> {
                 amm_config_state.trade_fee_rate,
                 amm_config_state.protocol_fee_rate,
                 amm_config_state.fund_fee_rate,
+                u128::from(token_0_vault_info.base.amount),
+                u128::from(token_1_vault_info.base.amount),
             )
             .ok_or(raydium_cp_swap::error::ErrorCode::ZeroTradingTokens)
             .unwrap();

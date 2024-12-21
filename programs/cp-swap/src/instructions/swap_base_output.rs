@@ -86,6 +86,8 @@ pub fn swap_base_output(
         ctx.accounts.amm_config.trade_fee_rate,
         ctx.accounts.amm_config.protocol_fee_rate,
         ctx.accounts.amm_config.fund_fee_rate,
+        u128::from(ctx.accounts.input_vault.amount),
+        u128::from(ctx.accounts.output_vault.amount),
     )
     .ok_or(ErrorCode::ZeroTradingTokens)?;
 

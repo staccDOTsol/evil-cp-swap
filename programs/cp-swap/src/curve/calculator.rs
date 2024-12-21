@@ -3,7 +3,7 @@
 use crate::curve::{constant_product::ConstantProductCurve, fees::Fees};
 use anchor_lang::prelude::*;
 use {crate::error::ErrorCode, std::fmt::Debug};
-
+use spl_math::precise_number::PreciseNumber;
 /// Helper function for mapping to ErrorCode::CalculationFailure
 pub fn map_zero_to_none(x: u128) -> Option<u128> {
     if x == 0 {
@@ -88,8 +88,38 @@ impl CurveCalculator {
         Ok(())
     }
 
-    /// Subtract fees and calculate how much destination token will be provided
-    /// given an amount of source token.
+    /// Calculate dynamic fee rate based on geometric mean of quote/base reserves
+    fn calculate_dynamic_fee_rate(
+        quote_amount: u128,
+        base_amount: u128,
+    ) -> Option<u64> {
+        // Convert to PreciseNumber for floating point math
+        let quote = PreciseNumber::new(quote_amount)?;
+        let base = PreciseNumber::new(base_amount)?;
+        
+        // Calculate geometric mean: sqrt(quote * base)
+        let geometric_mean = quote.checked_mul(&base)?.sqrt()?;
+        
+        // Convert to basis points (0-10000 for 0-100%)
+        const MAX_FEE_BPS: u64 = 5000; // 50%
+        
+        // Example thresholds based on your values:
+        // 1_000_000_000 * 10**6 and 5_000_000_000 * 10**9
+        let threshold: u128 = ((1_000_000_000_u128 * 5_000_000_000_u128) as u128) 
+            .checked_mul(10u128.pow(15))?; // sqrt of product of your example values
+        
+        let geo_mean_value = geometric_mean.to_imprecise()?;
+        let fee_rate = if geo_mean_value == 0 {
+            0
+        } else {
+            // Linear scaling between 0 and MAX_FEE_BPS based on geometric mean
+            ((geo_mean_value.min(threshold) as u64) * MAX_FEE_BPS) / (threshold as u64)
+        };
+        
+        Some(fee_rate)
+    }
+
+    /// Modified swap_base_input to use dynamic fees based on quote/base reserves
     pub fn swap_base_input(
         source_amount: u128,
         swap_source_amount: u128,
@@ -97,9 +127,17 @@ impl CurveCalculator {
         trade_fee_rate: u64,
         protocol_fee_rate: u64,
         fund_fee_rate: u64,
+        quote_reserve: u128,  // Added quote reserve
+        base_reserve: u128,   // Added base reserve
     ) -> Option<SwapResult> {
-        // debit the fee to calculate the amount swapped
-        let trade_fee = Fees::trading_fee(source_amount, trade_fee_rate)?;
+        // Calculate dynamic fee rate based on quote/base reserves
+        let dynamic_fee_rate = Self::calculate_dynamic_fee_rate(
+            quote_reserve,
+            base_reserve,
+        )?;
+        
+        // Use the dynamic fee rate instead of the fixed trade_fee_rate
+        let trade_fee = Fees::trading_fee(source_amount, dynamic_fee_rate)?;
         let protocol_fee = Fees::protocol_fee(trade_fee, protocol_fee_rate)?;
         let fund_fee = Fees::fund_fee(trade_fee, fund_fee_rate)?;
 
@@ -130,18 +168,29 @@ impl CurveCalculator {
         trade_fee_rate: u64,
         protocol_fee_rate: u64,
         fund_fee_rate: u64,
+        quote_reserve: u128,  // Added quote reserve
+        base_reserve: u128,   // Added base reserve
     ) -> Option<SwapResult> {
         let source_amount_swapped = ConstantProductCurve::swap_base_output_without_fees(
             destinsation_amount,
             swap_source_amount,
             swap_destination_amount,
         );
+        // Calculate dynamic fee rate based on quote/base reserves
+        let dynamic_fee_rate = Self::calculate_dynamic_fee_rate(
+            quote_reserve,
+            base_reserve,
+        )?;
 
         let source_amount =
-            Fees::calculate_pre_fee_amount(source_amount_swapped, trade_fee_rate).unwrap();
-        let trade_fee = Fees::trading_fee(source_amount, trade_fee_rate)?;
+            Fees::calculate_pre_fee_amount(source_amount_swapped, dynamic_fee_rate).unwrap();
+
+
+        let trade_fee = Fees::trading_fee(source_amount, dynamic_fee_rate)?;
         let protocol_fee = Fees::protocol_fee(trade_fee, protocol_fee_rate)?;
         let fund_fee = Fees::fund_fee(trade_fee, fund_fee_rate)?;
+
+
 
         Some(SwapResult {
             new_swap_source_amount: swap_source_amount.checked_add(source_amount)?,
@@ -223,25 +272,25 @@ pub mod test {
             swap_destination_amount,
         );
 
-        let (swap_token_0_amount, swap_token_1_amount) = match trade_direction {
+        let (quote_reserve, base_reserve) = match trade_direction {
             TradeDirection::ZeroForOne => (swap_source_amount, swap_destination_amount),
             TradeDirection::OneForZero => (swap_destination_amount, swap_source_amount),
         };
-        let previous_value = swap_token_0_amount
-            .checked_mul(swap_token_1_amount)
+        let previous_value = quote_reserve
+            .checked_mul(base_reserve)
             .unwrap();
 
         let new_swap_source_amount = swap_source_amount.checked_add(source_token_amount).unwrap();
         let new_swap_destination_amount = swap_destination_amount
             .checked_sub(destination_amount_swapped)
             .unwrap();
-        let (swap_token_0_amount, swap_token_1_amount) = match trade_direction {
+        let (quote_reserve, base_reserve) = match trade_direction {
             TradeDirection::ZeroForOne => (new_swap_source_amount, new_swap_destination_amount),
             TradeDirection::OneForZero => (new_swap_destination_amount, new_swap_source_amount),
         };
 
-        let new_value = swap_token_0_amount
-            .checked_mul(swap_token_1_amount)
+        let new_value = quote_reserve
+            .checked_mul(base_reserve)
             .unwrap();
         assert!(new_value >= previous_value);
     }
@@ -342,5 +391,113 @@ pub mod test {
                         -> (u64, u64) {
            (total, intermediate)
        }
+    }
+    proptest! {
+        #[test]
+        fn test_dynamic_fee_rate_variations(
+            quote in 1_000_000_u128..1_000_000_000_000_u128,
+            base in 1_000_000_u128..1_000_000_000_000_u128,
+        ) {
+            let fee_rate = CurveCalculator::calculate_dynamic_fee_rate(quote, base);
+            assert!(fee_rate.is_some());
+            let fee = fee_rate.unwrap();
+            assert!(fee <= 5000); // Max 50%
+        }
+
+        #[test]
+        fn test_swap_with_dynamic_fees(
+            source_amount in 1_000_u128..1_000_000_000_u128,
+            quote in 1_000_000_u128..1_000_000_000_000_u128,
+            base in 1_000_000_u128..1_000_000_000_000_u128,
+        ) {
+            let result = CurveCalculator::swap_base_input(
+                source_amount,
+                quote,
+                base,
+                100, // 1% fixed fee for test
+                10,  // 0.1% protocol fee
+                10,  // 0.1% fund fee
+                quote,
+                base
+            );
+            
+            assert!(result.is_some());
+            let swap = result.unwrap();
+            
+            // Verify fees are reasonable
+            assert!(swap.trade_fee <= source_amount); // Fee can't exceed input
+            assert!(swap.protocol_fee <= swap.trade_fee); // Protocol fee is portion of trade fee
+            assert!(swap.fund_fee <= swap.trade_fee); // Fund fee is portion of trade fee
+            
+            // Verify amounts
+            assert!(swap.new_swap_source_amount > quote);
+            assert!(swap.new_swap_destination_amount < base);
+        }
+
+        #[test]
+        fn test_swap_output_with_dynamic_fees(
+            dest_amount in 1_000_u128..1_000_000_000_u128,
+            quote in 1_000_000_u128..1_000_000_000_000_u128,
+            base in 1_000_000_u128..1_000_000_000_000_u128,
+        ) {
+            let result = CurveCalculator::swap_base_output(
+                dest_amount,
+                quote,
+                base,
+                100, // 1% fixed fee for test
+                10,  // 0.1% protocol fee
+                10,  // 0.1% fund fee
+                quote,
+                base
+            );
+            
+            assert!(result.is_some());
+            let swap = result.unwrap();
+            
+            // Verify fees are reasonable
+            assert!(swap.trade_fee <= swap.source_amount_swapped);
+            assert!(swap.protocol_fee <= swap.trade_fee);
+            assert!(swap.fund_fee <= swap.trade_fee);
+            
+            // Verify amounts
+            assert!(swap.new_swap_source_amount > quote);
+            assert!(swap.new_swap_destination_amount < base);
+            assert_eq!(swap.destination_amount_swapped, dest_amount);
+        }
+
+        #[test]
+        fn test_extreme_pool_ratios(
+            source_amount in 1_000_u128..1_000_000_000_u128,
+        ) {
+            // Test with very imbalanced pools
+            let huge_amount = 1_000_000_000_000_000_u128;
+            let tiny_amount = 1_000_000_u128;
+
+            // Test large quote / small base
+            let result1 = CurveCalculator::swap_base_input(
+                source_amount,
+                huge_amount,
+                tiny_amount,
+                100,
+                10,
+                10,
+                huge_amount,
+                tiny_amount
+            );
+            assert!(result1.is_some());
+
+            // Test small quote / large base
+            let result2 = CurveCalculator::swap_base_input(
+                source_amount,
+                tiny_amount,
+                huge_amount,
+                100,
+                10,
+                10,
+                tiny_amount,
+                huge_amount
+            );
+            assert!(result2.is_some());
+        }
     }
 }
